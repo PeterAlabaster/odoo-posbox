@@ -1,44 +1,61 @@
 # -*- coding: utf-8 -*-
-import logging
-import os
-import time
+# Part of Odoo. See LICENSE file for full copyright and licensing details.
 
-import openerp
-import openerp.addons.hw_proxy.controllers.main as hw_proxy
-import threading
+from __future__ import print_function
+import logging
 import subprocess
-from openerp import http
-from openerp.http import request
-from openerp.tools.translate import _
+import time
+import subprocess
+from threading import Lock
+
+
+from odoo import http
+from odoo.http import request
 
 _logger = logging.getLogger(__name__)
 
-upgrade_template = """
+
+# Those are the builtin raspberry pi USB modules, they should
+# not appear in the list of connected devices.
+BANNED_DEVICES = {
+    "0424:9514",    # Standard Microsystem Corp. Builtin Ethernet module
+    "1d6b:0002",    # Linux Foundation 2.0 root hub
+    "0424:ec00",    # Standard Microsystem Corp. Other Builtin Ethernet module
+}
+
+
+# drivers modules must add to drivers an object with a get_status() method
+# so that 'status' can return the status of all active drivers
+drivers = {}
+
+# keep a list of RS-232 devices that have been recognized by a driver,
+# so other drivers can skip them during probes
+rs232_devices = {}  # {'/path/to/device': 'driver'}
+rs232_lock = Lock() # must be held to update `rs232_devices`
+
+class Proxy(http.Controller):
+
+    def get_status(self):
+        statuses = {}
+        for driver in drivers:
+            statuses[driver] = drivers[driver].get_status()
+        return statuses
+
+    @http.route('/hw_proxy/hello', type='http', auth='none', cors='*')
+    def hello(self):
+        return "ping"
+
+    @http.route('/hw_proxy/handshake', type='json', auth='none', cors='*')
+    def handshake(self):
+        return True
+
+    @http.route('/hw_proxy/status', type='http', auth='none', cors='*')
+    def status_http(self, debug=None, **kwargs):
+        resp = """
 <!DOCTYPE HTML>
 <html>
     <head>
-        <title>Odoo's PosBox - Software Upgrade</title>
-        <script src="http://code.jquery.com/jquery-1.11.0.min.js"></script>
-        <script>
-        $(function(){
-            var upgrading = false;
-            $('#upgrade').click(function(){
-                console.log('click');
-                if(!upgrading){
-                    upgrading = true;
-                    $('#upgrade').text('Upgrading, Please Wait');
-                    $.ajax({
-                        url:'/hw_proxy/perform_upgrade/'
-                    }).then(function(status){
-                        $('#upgrade').html('Upgrade successful, restarting the posbox...');
-                        $('#upgrade').off('click');
-                    },function(){
-                        $('#upgrade').text('Upgrade Failed');
-                    });
-                }
-            });
-        });
-        </script>
+        <title>Odoo's PosBox</title>
         <style>
         body {
             width: 480px;
@@ -47,65 +64,161 @@ upgrade_template = """
             text-align: justify;
             color: #6B6B6B;
         }
-        .centering{
-            text-align: center;
+        .device {
+            border-bottom: solid 1px rgb(216,216,216);
+            padding: 9px;
         }
-        #upgrade {
-            padding: 20px;
-            background: rgb(121, 197, 107);
-            color: white;
-            border-radius: 3px;
-            text-align: center;
-            margin: 30px; 
-            text-decoration: none;
-            display: inline-block;
+        .device:nth-child(2n) {
+            background:rgb(240,240,240);
         }
         </style>
     </head>
     <body>
-        <h1>PosBox Software Upgrade</h1>
-        <p>
-        This tool will help you perform an upgrade of the PosBox's software over the
-	internet. 
-	<p></p>
-        However the preferred method to upgrade the posbox is to flash the sd-card with
-        the <a href='http://nightly.odoo.com/trunk/posbox/'>latest image</a>. The upgrade
-        procedure is explained into to the
-        <a href='https://www.odoo.com/documentation/user/point_of_sale/posbox/index.html'>PosBox manual</a>
-        </p>
-        <p>
-        To upgrade the posbox, click on the upgrade button. The upgrade will take a few minutes. <b>Do not reboot</b> the PosBox during the upgrade.
-        </p>
-        <p>
-        Latest patch:
-        </p>
-        <pre>
+        <h1>Hardware Status</h1>
+        <p>The list of enabled drivers and their status</p>
 """
-upgrade_template += subprocess.check_output("git --work-tree=/home/odoo/odoo/ --git-dir=/home/odoo/odoo/.git log -1", shell=True).replace("\n", "<br/>")
-upgrade_template += """
-        </pre>
-        <div class='centering'>
-            <a href='#' id='upgrade'>Upgrade</a>
-        </div>
-    </body>
-</html>
+        statuses = self.get_status()
+        for driver in statuses:
 
-"""
+            status = statuses[driver]
 
-class PosboxUpgrader(hw_proxy.Proxy):
-    def __init__(self):
-        super(PosboxUpgrader,self).__init__()
-        self.upgrading = threading.Lock()
+            if status['status'] == 'connecting':
+                color = 'black'
+            elif status['status'] == 'connected':
+                color = 'green'
+            else:
+                color = 'red'
 
-    @http.route('/hw_proxy/upgrade', type='http', auth='none', )
-    def upgrade(self):
-        return upgrade_template 
-    
-    @http.route('/hw_proxy/perform_upgrade', type='http', auth='none')
-    def perform_upgrade(self):
-        self.upgrading.acquire()
+            resp += "<h3 style='color:"+color+";'>"+driver+' : '+status['status']+"</h3>\n"
+            resp += "<ul>\n"
+            for msg in status['messages']:
+                resp += '<li>'+msg+'</li>\n'
+            resp += "</ul>\n"
+        resp += """
+            <h2>Connected Devices</h2>
+            <p>The list of connected USB devices as seen by the posbox</p>
+        """
+        if debug is None:
+            resp += """(<a href="/hw_proxy/status?debug">debug version</a>)"""
+        devices = subprocess.check_output("lsusb").split('\n')
+        count   = 0
+        resp += "<div class='devices'>\n"
+        for device in devices:
+            device_name = device[device.find('ID')+2:]
+            device_id   = device_name.split()[0]
+            if not (device_id in BANNED_DEVICES):
+                resp += "<div class='device' data-device='"+device+"'>"+device_name+"</div>\n"
+                count += 1
 
-        os.system('/home/odoo/odoo/addons/point_of_sale/tools/posbox/configuration/posbox_update.sh')
-        
-        self.upgrading.release()
-        return 'SUCCESS'
+        if count == 0:
+            resp += "<div class='device'>No USB Device Found</div>"
+
+        resp += "</div>\n</body>\n</html>\n\n"
+
+        if debug is not None:
+            resp += """
+                <h3>Debug version</h3>
+                <p><tt>lsusb -v</tt> output:</p>
+                <pre>
+                %s
+                </pre>
+            """ % subprocess.check_output('lsusb -v', shell=True)
+
+        return request.make_response(resp,{
+            'Cache-Control': 'no-cache',
+            'Content-Type': 'text/html; charset=utf-8',
+            'Access-Control-Allow-Origin':  '*',
+            'Access-Control-Allow-Methods': 'GET',
+            })
+
+    @http.route('/hw_proxy/status_json', type='json', auth='none', cors='*')
+    def status_json(self):
+        return self.get_status()
+
+    @http.route('/hw_proxy/scan_item_success', type='json', auth='none', cors='*')
+    def scan_item_success(self, ean):
+        """
+        A product has been scanned with success
+        """
+        print('scan_item_success: %s', ean)
+
+    @http.route('/hw_proxy/scan_item_error_unrecognized', type='json', auth='none', cors='*')
+    def scan_item_error_unrecognized(self, ean):
+        """
+        A product has been scanned without success
+        """
+        print('scan_item_error_unrecognized: %s', ean)
+
+    @http.route('/hw_proxy/help_needed', type='json', auth='none', cors='*')
+    def help_needed(self):
+        """
+        The user wants an help (ex: light is on)
+        """
+        print("help_needed")
+
+    @http.route('/hw_proxy/help_canceled', type='json', auth='none', cors='*')
+    def help_canceled(self):
+        """
+        The user stops the help request
+        """
+        print("help_canceled")
+
+    @http.route('/hw_proxy/payment_request', type='json', auth='none', cors='*')
+    def payment_request(self, price):
+        """
+        The PoS will activate the method payment
+        """
+        print("payment_request: price:%s" % price)
+        return 'ok'
+
+    @http.route('/hw_proxy/payment_status', type='json', auth='none', cors='*')
+    def payment_status(self):
+        print("payment_status")
+        return { 'status':'waiting' }
+
+    @http.route('/hw_proxy/payment_cancel', type='json', auth='none', cors='*')
+    def payment_cancel(self):
+        print("payment_cancel")
+
+    @http.route('/hw_proxy/transaction_start', type='json', auth='none', cors='*')
+    def transaction_start(self):
+        print('transaction_start')
+
+    @http.route('/hw_proxy/transaction_end', type='json', auth='none', cors='*')
+    def transaction_end(self):
+        print('transaction_end')
+
+    @http.route('/hw_proxy/cashier_mode_activated', type='json', auth='none', cors='*')
+    def cashier_mode_activated(self):
+        print('cashier_mode_activated')
+
+    @http.route('/hw_proxy/cashier_mode_deactivated', type='json', auth='none', cors='*')
+    def cashier_mode_deactivated(self):
+        print('cashier_mode_deactivated')
+
+    @http.route('/hw_proxy/open_cashbox', type='json', auth='none', cors='*')
+    def open_cashbox(self):
+        print('open_cashbox')
+
+    @http.route('/hw_proxy/print_receipt', type='json', auth='none', cors='*')
+    def print_receipt(self, receipt):
+        print('print_receipt %s', receipt)
+
+    @http.route('/hw_proxy/is_scanner_connected', type='json', auth='none', cors='*')
+    def is_scanner_connected(self, receipt):
+        print('is_scanner_connected?')
+        return False
+
+    @http.route('/hw_proxy/scanner', type='json', auth='none', cors='*')
+    def scanner(self, receipt):
+        print('scanner')
+        time.sleep(10)
+        return ''
+
+    @http.route('/hw_proxy/log', type='json', auth='none', cors='*')
+    def log(self, arguments):
+        _logger.info(' '.join(str(v) for v in arguments))
+
+    @http.route('/hw_proxy/print_pdf_invoice', type='json', auth='none', cors='*')
+    def print_pdf_invoice(self, pdfinvoice):
+print('print_pdf_invoice %s' % pdfinvoice)
