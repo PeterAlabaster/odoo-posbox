@@ -221,4 +221,4 @@ class Proxy(http.Controller):
 
     @http.route('/hw_proxy/print_pdf_invoice', type='json', auth='none', cors='*')
     def print_pdf_invoice(self, pdfinvoice):
-print('print_pdf_invoice %s' % pdfinvoice)
+        print('print_pdf_invoice %s' % pdfinvoice)
